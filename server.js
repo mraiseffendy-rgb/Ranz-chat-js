@@ -11,26 +11,22 @@ const HOST = "0.0.0.0";
 const PORT = Number(process.env.SERVER_PORT || process.env.PORT || process.env.SERVER_ALLOCATION_PORT || 2487);
 const DATA_FILE = path.join(__dirname, "data.json");
 const HTML_FILE = path.join(__dirname, "index.html");
-
+const COOKIE_NAME = "ranzchat_session";
 const SESSION_DAYS = 30;
-const MAX_BODY_SIZE = 25 * 1024 * 1024;
+const MAX_BODY_SIZE = 25 * 1024 * 1024; 
 
-/* ============ AI MODERATION RULES ============ */
+/* ============ AI MODERATION ============ */
 const AI_RULES = {
-  windowMs: 10000, maxInWindow: 5, repeatLimit: 3, longBurstWindowMs: 30000, longBurstMax: 10,
-  spamFlagThreshold: 2, 
-  immediateBlockCategories: ["judol", "toxic", "sara", "ancaman", "porno", "doxx"],
-  immediateBlockSeverities: ["high"], 
-  flagResetMs: 24 * 60 * 60 * 1000, baseBanMs: 10 * 60 * 1000,
+  windowMs: 10000, maxInWindow: 6, repeatLimit: 3, longBurstWindowMs: 30000, longBurstMax: 15,
+  spamFlagThreshold: 6, immediateBlockCategories: ["judol", "toxic", "sara", "ancaman", "porno", "doxx"],
+  immediateBlockSeverities: ["high"], flagResetMs: 24 * 60 * 60 * 1000, baseBanMs: 10 * 60 * 1000,
   maxBanMs: 6 * 60 * 60 * 1000, resetStrikeMs: 7 * 24 * 60 * 60 * 1000
 };
 const REPORT_THRESHOLDS = { text: 12, media: 15 };
 const APPEAL_MIN_MS = 15000;
 const APPEAL_MAX_MS = 60000;
 const spamTracker = new Map();
-const reportReviewTriggered = new Set();
 
-/* ============ MISTRAL AI ============ */
 let lastMistralCall = 0;
 const mistralQueue = [];
 let mistralProcessing = false;
@@ -51,7 +47,6 @@ async function processMistralQueue() {
     const job = mistralQueue.shift();
     const elapsed = Date.now() - lastMistralCall;
     if (elapsed < config.MISTRAL_MIN_INTERVAL_MS) await sleep(config.MISTRAL_MIN_INTERVAL_MS - elapsed);
-    
     let attempt = 0, success = false, lastError = null;
     while (attempt <= config.MISTRAL_MAX_RETRIES && !success) {
       try {
@@ -145,16 +140,19 @@ let db = {
   users: {}, usersById: {}, sessions: {}, banSessions: {}, blocks: [], reports: [], appeals: [], moderationLog: [], savedContacts: {},
   statuses: [], groups: [], 
   messages: new Map(), 
-  conversations: {}, 
+  conversations: {}, // Direct Object References
   groupMessages: {}, 
   pendingDeliveries: {} 
 };
 
 let saveTimer = null;
+
+// BACKGROUND SAVE: 0ms Blocking
 function scheduleSave() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
+    // setImmediate memastikan HTTP request dan WS diselesaikan dulu sebelum save
     setImmediate(() => {
       try {
         const arrMessages = Array.from(db.messages.values());
@@ -168,7 +166,7 @@ function scheduleSave() {
         });
       } catch (e) { console.error("[DB] Save gagal:", e.message); }
     });
-  }, 3000); 
+  }, 3000); // Debounce 3s
 }
 
 function loadDB() {
@@ -248,9 +246,7 @@ function parseCookies(req) {
   return r;
 }
 function getCurrentUser(req) {
-  let token = req.headers["authorization"] ? req.headers["authorization"].replace("Bearer ", "") : null;
-  if (!token) token = parseCookies(req)["ranzchat_session"];
-  
+  const token = parseCookies(req)[COOKIE_NAME];
   if (!token) return null;
   const s = db.sessions[token];
   if (!s || s.expiresAt < Date.now()) { if (s) delete db.sessions[token]; return null; }
@@ -262,13 +258,12 @@ function createSession(res, username) {
   const t = makeId(32);
   db.sessions[t] = { username, expiresAt: Date.now() + SESSION_DAYS * 86400000 };
   scheduleSave();
-  res.setHeader("Set-Cookie", `ranzchat_session=${encodeURIComponent(t)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS * 86400}`);
-  return t;
+  res.setHeader("Set-Cookie", `${COOKIE_NAME}=${encodeURIComponent(t)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS * 86400}`);
 }
 function clearSession(req, res) {
-  const token = req.headers["authorization"] ? req.headers["authorization"].replace("Bearer ", "") : parseCookies(req)["ranzchat_session"];
-  if (token && db.sessions[token]) { delete db.sessions[token]; scheduleSave(); }
-  res.setHeader("Set-Cookie", `ranzchat_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+  const t = parseCookies(req)[COOKIE_NAME];
+  if (t && db.sessions[t]) { delete db.sessions[t]; scheduleSave(); }
+  res.setHeader("Set-Cookie", `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
 }
 function createBanSession(username) {
   for (const [t, s] of Object.entries(db.banSessions)) if (s.username === username) delete db.banSessions[t];
@@ -282,7 +277,7 @@ function getBanSession(token) {
   return s;
 }
 
-/* ============ BAN LOGIC ============ */
+/* ============ BAN & AI LOGIC ============ */
 function isTempBanned(user) {
   if (!user.tempBanned) return false;
   if (Date.now() >= user.tempBanUntil) {
@@ -295,6 +290,7 @@ function removeMessageById(id) {
   const msg = db.messages.get(id);
   if (!msg) return;
   db.messages.delete(id);
+  
   if (msg.groupId) {
     if (db.groupMessages[msg.groupId]) db.groupMessages[msg.groupId] = db.groupMessages[msg.groupId].filter(m => m.id !== id);
     const g = db.groups.find(x => x.id === msg.groupId);
@@ -318,7 +314,7 @@ function recordSpamFlag(username, reason) {
   scheduleSave();
 
   if (user.spamFlags >= AI_RULES.spamFlagThreshold) {
-    applyTempBan(username, `Akumulasi pelanggaran: ${reason}`);
+    applyTempBan(username, `Akumulasi ${user.spamFlags} pelanggaran: ${reason}`);
     return;
   }
   broadcastToUser(username, { type: "spam_warning", count: user.spamFlags, threshold: AI_RULES.spamFlagThreshold, reason });
@@ -334,13 +330,15 @@ function applyTempBan(username, reason) {
   user.lastOffenseAt = Date.now(); user.spamFlags = 0;
 
   for (const [t, s] of Object.entries(db.sessions)) if (s.username === username) delete db.sessions[t];
-  db.appeals = db.appeals.filter(a => a.username !== username); 
-
   db.moderationLog.unshift({ id: makeId(8), username, type: "auto_temp_ban", reason, strike: user.tempBanStrikes, durationMs: duration, createdAt: new Date().toISOString(), expiresAt: new Date(user.tempBanUntil).toISOString(), status: "active" });
   scheduleSave();
 
   const banToken = createBanSession(username);
-  broadcastToUser(username, { type: "account_temp_banned", reason, until: user.tempBanUntil, strike: user.tempBanStrikes, banToken, appeal: null });
+  const currentAppeal = db.appeals.filter(a => a.username === username).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0];
+  broadcastToUser(username, {
+    type: "account_temp_banned", reason, until: user.tempBanUntil, strike: user.tempBanStrikes, banToken,
+    appeal: currentAppeal ? { id: currentAppeal.id, status: currentAppeal.status, decision: currentAppeal.decision, aiReason: currentAppeal.aiReason } : null
+  });
 }
 
 function finalizeAppeal(appeal, approved, reason, decider) {
@@ -376,31 +374,9 @@ setInterval(async () => {
   }
 }, 4000);
 
-function checkReportThreshold(messageId) {
-  const message = db.messages.get(messageId);
-  if (!message || reportReviewTriggered.has(messageId)) return;
-  const reporters = new Set();
-  for (const r of db.reports) if (r.messageId === messageId) reporters.add(r.by);
-  const threshold = message.type === "text" ? REPORT_THRESHOLDS.text : REPORT_THRESHOLDS.media;
-  
-  if (reporters.size >= threshold) {
-    reportReviewTriggered.add(messageId);
-    enqueueModeration(async () => {
-      const verdict = await aiReviewReport(message.content, "Banyak laporan");
-      if (verdict.violation) {
-        applyTempBan(message.from, `Dilaporkan ${reporters.size}x & terbukti: ${verdict.reason}`);
-        for (const r of db.reports) if (r.messageId === messageId) broadcastToUser(r.by, { type: "report_result", ok: true, message: `Laporan diverifikasi AI.` });
-      } else {
-        for (const r of db.reports) if (r.messageId === messageId) broadcastToUser(r.by, { type: "report_result", ok: false, message: `Pesan tidak melanggar.` });
-      }
-    });
-  }
-}
-
 /* ============ HTTP HELPERS ============ */
 function sendJSON(res, status, data) {
-  if (res.writableEnded || res.headersSent) return;
-  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" });
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
   res.end(JSON.stringify(data));
 }
 function readBody(req) {
@@ -454,11 +430,6 @@ function markReadBetween(userAId, userBId) {
 
 /* ============ HTTP SERVER ============ */
 const server = http.createServer(async (req, res) => {
-  if (req.method === "OPTIONS") {
-    res.writeHead(204, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type, Authorization" });
-    return res.end();
-  }
-
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const route = url.pathname;
 
@@ -478,9 +449,8 @@ const server = http.createServer(async (req, res) => {
       
       const salt = crypto.randomBytes(16).toString("hex");
       const user = { id: makeUserId(), username, passwordSalt: salt, passwordHash: hashPassword(password, salt), role: "user", verified: false, banned: false, tempBanned: false, tempBanUntil: 0, tempBanReason: "", tempBanStrikes: 0, lastOffenseAt: 0, spamFlags: 0, lastSpamFlagAt: 0, bio: "", createdAt: new Date().toISOString() };
-      db.users[username] = user; db.usersById[user.id] = username; scheduleSave(); 
-      const token = createSession(res, username);
-      return sendJSON(res, 201, { success: true, user: publicUser(user), token });
+      db.users[username] = user; db.usersById[user.id] = username; scheduleSave(); createSession(res, username);
+      return sendJSON(res, 201, { success: true, user: publicUser(user) });
     }
 
     if (req.method === "POST" && route === "/api/login") {
@@ -490,15 +460,13 @@ const server = http.createServer(async (req, res) => {
       const user = key ? db.users[key] : null;
       if (!user || !verifyPassword(password, user)) return sendJSON(res, 401, { success: false, error: "Login gagal." });
       if (user.banned) return sendJSON(res, 403, { success: false, permanentBan: true, error: "Banned permanen." });
-      
       if (isTempBanned(user)) {
         const banToken = createBanSession(key);
-        const app = db.appeals.filter(a => a.username === key && (a.status === "pending" || a.status === "rejected")).sort((a,b) => new Date(b.createdAt)-new Date(a.createdAt))[0];
+        const app = db.appeals.filter(a => a.username === key).sort((a,b) => new Date(b.createdAt)-new Date(a.createdAt))[0];
         return sendJSON(res, 429, { success: false, tempBanned: true, reason: user.tempBanReason, until: user.tempBanUntil, strike: user.tempBanStrikes, banToken, appeal: app ? { id: app.id, status: app.status, decision: app.decision, aiReason: app.aiReason } : null });
       }
-      
-      const token = createSession(res, key); markDeliveredFor(user.id);
-      return sendJSON(res, 200, { success: true, user: publicUser(user), token });
+      createSession(res, key); markDeliveredFor(user.id);
+      return sendJSON(res, 200, { success: true, user: publicUser(user) });
     }
 
     if (req.method === "POST" && route === "/api/logout") { clearSession(req, res); return sendJSON(res, 200, { success: true }); }
@@ -513,7 +481,7 @@ const server = http.createServer(async (req, res) => {
       const sess = getBanSession(url.searchParams.get("token") || "");
       if (!sess) return sendJSON(res, 401, { success: false });
       const user = db.users[sess.username];
-      const app = db.appeals.filter(a => a.username === sess.username && (a.status === "pending" || a.status === "rejected")).sort((a,b) => new Date(b.createdAt)-new Date(a.createdAt))[0];
+      const app = db.appeals.filter(a => a.username === sess.username).sort((a,b) => new Date(b.createdAt)-new Date(a.createdAt))[0];
       return sendJSON(res, 200, { success: true, banned: isTempBanned(user), reason: user.tempBanReason, until: user.tempBanUntil, strike: user.tempBanStrikes, appeal: app ? { id: app.id, status: app.status, decision: app.decision, aiReason: app.aiReason } : null });
     }
 
@@ -535,7 +503,7 @@ const server = http.createServer(async (req, res) => {
       const sess = getBanSession(url.searchParams.get("token") || "");
       if (!sess) return sendJSON(res, 401, { success: false });
       const user = db.users[sess.username];
-      const app = db.appeals.filter(a => a.username === sess.username && (a.status === "pending" || a.status === "rejected")).sort((a,b) => new Date(b.createdAt)-new Date(a.createdAt))[0];
+      const app = db.appeals.filter(a => a.username === sess.username).sort((a,b) => new Date(b.createdAt)-new Date(a.createdAt))[0];
       return sendJSON(res, 200, { success: true, banned: isTempBanned(user), reason: user.tempBanReason, until: user.tempBanUntil, appeal: app ? { id: app.id, status: app.status, decision: app.decision, aiReason: app.aiReason } : null });
     }
 
@@ -605,6 +573,9 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, { success: true, users: results });
     }
 
+    // ==========================================
+    // INSTANT HISTORY (0ms)
+    // ==========================================
     if (req.method === "GET" && route === "/api/messages") {
       const user = requireLogin(req, res); if (!user) return;
       const targetU = db.users[getUsernameById(url.searchParams.get("userId"))];
@@ -613,6 +584,7 @@ const server = http.createServer(async (req, res) => {
       markReadBetween(user.id, targetU.id);
       const convKey = [user.id, targetU.id].sort().join("_");
       
+      // Langsung return array memori tanpa mapping
       const msgs = db.conversations[convKey] || [];
       return sendJSON(res, 200, { success: true, messages: msgs });
     }
@@ -709,6 +681,9 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, { success: true });
     }
 
+    // ==========================================
+    // ZERO-DELAY SEND MESSAGE
+    // ==========================================
     if (req.method === "POST" && route === "/api/messages") {
       const user = requireLogin(req, res); if (!user) return;
       if (isTempBanned(user)) return sendJSON(res, 429, { success: false, tempBanned: true, error: "Diblokir." });
@@ -853,16 +828,7 @@ const sockets = new Map();
 server.on("upgrade", (req, socket, head) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   if (url.pathname !== "/ws") { socket.destroy(); return; }
-  
-  let token = null;
-  const authHeader = req.headers["authorization"];
-  if (authHeader) token = authHeader.replace("Bearer ", "");
-  
-  if (!token) {
-    const cookies = parseCookies(req);
-    token = cookies["ranzchat_session"];
-  }
-
+  const token = parseCookies(req)[COOKIE_NAME];
   const session = token ? db.sessions[token] : null;
   if (!session || session.expiresAt < Date.now()) { socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n"); socket.destroy(); return; }
   const user = db.users[session.username];
@@ -906,32 +872,10 @@ function broadcastToUser(username, payload) {
   for (const ws of clients) if (ws.readyState === WebSocket.OPEN) ws.send(msg);
 }
 
-/* ============ IP DETECTION & START ============ */
-function cleanIP(value) {
-  if (!value) return null;
-  let r = String(value).trim().replace(/^https?:\/\//i, "").split("/")[0];
-  if (/^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(r)) r = r.replace(/:\d+$/, "");
-  r = r.replace(/^\[|\]$/g, "");
-  if (!r || r === "0.0.0.0" || r === "127.0.0.1" || r === "localhost") return null;
-  return r;
-}
-function getAllocationIP() {
-  const possible = [process.env.ALLOCATION_IP, process.env.SERVER_IP, process.env.SERVER_ADDRESS, process.env.P_SERVER_IP, process.env.SERVER_ALLOCATION_IP, process.env.ALLOCATION_ADDRESS, process.env.SERVER_NODE_IP];
-  for (const v of possible) { const ip = cleanIP(v); if (ip) return ip; }
-  const ifs = os.networkInterfaces();
-  for (const entries of Object.values(ifs)) for (const it of entries || []) if (it.family === "IPv4" && !it.internal && it.address !== "0.0.0.0") { const ip = cleanIP(it.address); if (ip) return ip; }
-  return null;
-}
-
+/* ============ START ============ */
 loadDB();
 server.listen(PORT, HOST, () => {
-  const ip = getAllocationIP();
-  console.log(`\n==========================================\n  RANZCHAT — ZERO DELAY ENGINE (FLUTTER READY)\n==========================================\nStatus: ONLINE | Port: ${PORT}`);
-  if (ip) console.log(`Detected URL : http://${ip}:${PORT}`);
-  else console.log(`Local URL: http://127.0.0.1:${PORT}`);
-  console.log(`Auth Mode: Bearer Token & Cookie (Dual Support)`);
-  console.log(`AI Guard: BACKGROUND PROCESSING ACTIVE`);
-  console.log(`==========================================\n`);
+  console.log(`\n==========================================\n  RANZCHAT — ZERO-DELAY ENGINE\n==========================================\nStatus: ONLINE | Port: ${PORT}\nOptimization: Fragment Render + Background Save\n==========================================\n`);
 });
 process.on("SIGINT", () => { saveDB(); process.exit(0); });
 process.on("SIGTERM", () => { saveDB(); process.exit(0); });
